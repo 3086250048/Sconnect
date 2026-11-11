@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Any
+
+
+URL_RE = re.compile(r"^(turns?):(\[[^\]]+\]|[^:?]+):(\d+)\?transport=([a-z]+)$")
+
+
+def api_base() -> str:
+    return os.getenv("SCONNECT_API_URL", "http://127.0.0.1:8080").rstrip("/")
+
+
+def api_request(path: str, method: str = "GET", payload: dict[str, Any] | None = None) -> Any:
+    token = os.getenv("SCONNECT_ADMIN_TOKEN", "")
+    if not token:
+        raise SystemExit("SCONNECT_ADMIN_TOKEN is required when an account ID is used")
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(api_base() + path, data=data, method=method)
+    request.add_header("Authorization", f"Bearer {token}")
+    request.add_header("Accept", "application/json")
+    if payload is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            message = json.loads(raw).get("error", raw)
+        except Exception:
+            message = raw
+        raise SystemExit(f"HTTP {exc.code}: {message}") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"cannot reach {api_base()}: {exc.reason}") from exc
+
+
+def select_url(urls: list[str], transport: str) -> str:
+    scheme = "turns:" if transport == "tls" else "turn:"
+    turn_transport = "udp" if transport == "udp" else "tcp"
+    for url in urls:
+        if url.startswith(scheme) and url.endswith(f"?transport={turn_transport}"):
+            return url
+    raise SystemExit(f"no {transport} URL in: {', '.join(urls)}")
+
+
+def parse_url(url: str) -> tuple[str, int]:
+    match = URL_RE.match(url)
+    if not match:
+        raise SystemExit(f"cannot parse TURN URL: {url}")
+    host = match.group(2).strip("[]")
+    return host, int(match.group(3))
+
+
+def load_ice(args: argparse.Namespace) -> tuple[str, int, str, str]:
+    username = args.username or os.getenv("TURN_USERNAME", "")
+    password = args.password or os.getenv("TURN_PASSWORD", "")
+    urls: list[str] = []
+
+    if args.ice_json:
+        with open(args.ice_json, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        servers = document.get("iceServers") or document.get("ice_servers") or []
+        if not servers:
+            raise SystemExit("ICE JSON has no iceServers")
+        server = servers[0]
+        urls = list(server.get("urls") or [])
+        username = username or str(server.get("username", ""))
+        password = password or str(server.get("credential", ""))
+    elif args.account_id:
+        ice = api_request(f"/v1/accounts/{args.account_id}/ice-servers?ttl_seconds=600")
+        server = ice["iceServers"][0]
+        urls = list(server["urls"])
+        username = str(server["username"])
+        password = str(server["credential"])
+
+    if args.host and args.port:
+        host = args.host
+        port = args.port
+    elif urls:
+        host, port = parse_url(select_url(urls, args.transport))
+    else:
+        host = args.host or os.getenv("TURN_HOST", "")
+        port = args.port or int(os.getenv("TURN_PORT", "0"))
+    if not host or not port:
+        raise SystemExit("host/port are required when no ICE JSON or account ID is supplied")
+    if not username or not password:
+        raise SystemExit("username/password are required when no ICE JSON or account ID is supplied")
+    return host, int(port), username, password
+
+
+def uclient_args(
+    args: argparse.Namespace,
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+) -> list[str]:
+    command = [
+        "turnutils_uclient",
+        "-y",
+        "-c",
+        "-m",
+        str(args.clients),
+        "-n",
+        str(args.messages),
+        "-l",
+        str(args.length),
+        "-z",
+        str(args.interval_ms),
+        "-u",
+        username,
+        "-w",
+        password,
+        "-p",
+        str(port),
+    ]
+    if args.transport == "tcp":
+        command.append("-t")
+    elif args.transport == "tls":
+        command.extend(["-t", "-S"])
+    if args.ca_file:
+        command.extend(["-E", args.ca_file])
+    command.append(host)
+    return command
+
+
+def runner_command(args: argparse.Namespace, command: list[str]) -> list[str]:
+    runner = args.runner
+    if runner == "auto":
+        runner = "local" if shutil.which("turnutils_uclient") else "docker"
+    if runner == "local":
+        if not shutil.which("turnutils_uclient"):
+            raise SystemExit("turnutils_uclient is not installed; use --runner docker")
+        return command
+    if not shutil.which("docker"):
+        raise SystemExit("docker is not installed")
+    image = os.getenv("COTURN_IMAGE", "coturn/coturn:4.18.0-r0-debian")
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        "host",
+        "--entrypoint",
+        "turnutils_uclient",
+        image,
+        *command[1:],
+    ]
+
+
+def usage(account_id: str) -> dict[str, Any] | None:
+    if not account_id:
+        return None
+    return api_request(f"/v1/accounts/{account_id}/usage")
+
+
+def redact(command: list[str]) -> str:
+    redacted = list(command)
+    for index, value in enumerate(redacted[:-1]):
+        if value == "-w":
+            redacted[index + 1] = "***"
+    return shlex.join(redacted)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run a real TURN allocation and traffic test")
+    parser.add_argument("account_id", nargs="?", help="Sconnect account ID; credentials are fetched from the API")
+    parser.add_argument("--ice-json", help="use a saved ICE JSON file instead of the control-plane API")
+    parser.add_argument("--username", default="", help="TURN username when not using an account ID")
+    parser.add_argument("--password", default="", help="TURN password when not using an account ID")
+    parser.add_argument("--host", help="TURN hostname or IP")
+    parser.add_argument("--port", type=int, help="TURN port")
+    parser.add_argument("--transport", choices=("udp", "tcp", "tls"), default="udp")
+    parser.add_argument("--ca-file", help="CA bundle for TURN TLS verification")
+    parser.add_argument("--clients", type=int, default=2, help="simultaneous TURN clients (default: 2)")
+    parser.add_argument("--messages", type=int, default=1000)
+    parser.add_argument("--length", type=int, default=1200)
+    parser.add_argument("--interval-ms", type=int, default=1)
+    parser.add_argument("--runner", choices=("auto", "local", "docker"), default="auto")
+    parser.add_argument("--usage-wait", type=float, default=6.0, help="seconds to wait for traffic polling")
+    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    host, port, username, password = load_ice(args)
+    command = runner_command(args, uclient_args(args, host, port, username, password))
+
+    before = usage(args.account_id)
+    print(f"target: {host}:{port} transport={args.transport}")
+    print(f"command: {redact(command)}")
+    if args.dry_run:
+        return 0
+
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(command, timeout=args.timeout, check=False)
+    except subprocess.TimeoutExpired:
+        print(f"TURN test timed out after {args.timeout:.0f}s", file=sys.stderr)
+        return 124
+    elapsed = time.monotonic() - started
+    print(f"client exit code: {completed.returncode}; elapsed: {elapsed:.2f}s")
+
+    if args.account_id:
+        time.sleep(max(0, args.usage_wait))
+        after = usage(args.account_id)
+        if before and after:
+            delta = after["total_bytes"] - before["total_bytes"]
+            print(f"usage delta: {delta} bytes ({delta / max(elapsed, 0.001):.0f} B/s observed)")
+            print(f"active sessions: {after['active_sessions']}")
+            print(f"remaining bytes: {after['remaining_bytes']}")
+    return completed.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

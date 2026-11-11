@@ -1,0 +1,15 @@
+.env
+.git-data/
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+data/
+certs/
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm

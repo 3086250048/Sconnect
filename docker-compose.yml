@@ -1,0 +1,61 @@
+services:
+  sconnect:
+    build:
+      context: .
+      args:
+        COTURN_IMAGE: ${COTURN_IMAGE:-coturn/coturn:4.18.0-r0-debian}
+    image: sconnect-turn:local
+    container_name: sconnect-turn
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 45s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      SCONNECT_ADMIN_TOKEN: ${SCONNECT_ADMIN_TOKEN:?set SCONNECT_ADMIN_TOKEN in .env}
+      SCONNECT_DATA_DIR: /data
+      SCONNECT_BIND: ${SCONNECT_BIND:-127.0.0.1}
+      SCONNECT_PORT: ${SCONNECT_PORT:-8080}
+      SCONNECT_MAX_ACCOUNTS: ${SCONNECT_MAX_ACCOUNTS:-20}
+      SCONNECT_USAGE_POLL_SECONDS: ${SCONNECT_USAGE_POLL_SECONDS:-5}
+      SCONNECT_SUPERVISOR_ENABLED: ${SCONNECT_SUPERVISOR_ENABLED:-true}
+      TURN_PUBLIC_HOST: ${TURN_PUBLIC_HOST:?set TURN_PUBLIC_HOST in .env}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
+      TURN_LISTEN_IP: ${TURN_LISTEN_IP:-0.0.0.0}
+      TURN_RELAY_IP: ${TURN_RELAY_IP:-}
+      TURN_PORT_BASE: ${TURN_PORT_BASE:-34780}
+      TURN_TLS_PORT_BASE: ${TURN_TLS_PORT_BASE:-54000}
+      TURN_RELAY_PORT_BASE: ${TURN_RELAY_PORT_BASE:-50000}
+      TURN_RELAY_PORTS_PER_ACCOUNT: ${TURN_RELAY_PORTS_PER_ACCOUNT:-64}
+      TURN_METRICS_PORT_BASE: ${TURN_METRICS_PORT_BASE:-39100}
+      TURN_CLI_PORT_BASE: ${TURN_CLI_PORT_BASE:-39000}
+      TURN_TLS_ENABLED: ${TURN_TLS_ENABLED:-false}
+      TURN_TLS_CERT: ${TURN_TLS_CERT:-/certs/fullchain.pem}
+      TURN_TLS_KEY: ${TURN_TLS_KEY:-/certs/privkey.pem}
+      TURN_ALLOW_PRIVATE_PEERS: ${TURN_ALLOW_PRIVATE_PEERS:-false}
+      TURN_ALLOW_LOOPBACK_PEERS: ${TURN_ALLOW_LOOPBACK_PEERS:-false}
+      TURN_RELAY_THREADS: ${TURN_RELAY_THREADS:-1}
+      SCONNECT_API_TLS_CERT: ${SCONNECT_API_TLS_CERT:-}
+      SCONNECT_API_TLS_KEY: ${SCONNECT_API_TLS_KEY:-}
+    volumes:
+      - sconnect-data:/data
+      - ./certs:/certs:ro
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+volumes:
+  sconnect-data:
+    name: sconnect-data

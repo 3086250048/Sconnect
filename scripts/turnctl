@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from typing import Any
+
+
+def api_base() -> str:
+    return os.getenv("SCONNECT_API_URL", "http://127.0.0.1:8080").rstrip("/")
+
+
+def admin_token(override: str | None = None) -> str:
+    token = override or os.getenv("SCONNECT_ADMIN_TOKEN", "")
+    if not token:
+        raise SystemExit("SCONNECT_ADMIN_TOKEN is required")
+    return token
+
+
+def request(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    token: str | None = None,
+    authenticate: bool = True,
+) -> tuple[Any, str]:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    http_request = urllib.request.Request(api_base() + path, data=data, method=method)
+    http_request.add_header("Accept", "application/json")
+    if payload is not None:
+        http_request.add_header("Content-Type", "application/json")
+    if authenticate:
+        http_request.add_header("Authorization", f"Bearer {admin_token(token)}")
+    try:
+        with urllib.request.urlopen(http_request, timeout=15) as response:
+            raw = response.read()
+            content_type = response.headers.get("Content-Type", "")
+            if not raw:
+                return None, content_type
+            if content_type.startswith("application/json"):
+                return json.loads(raw), content_type
+            return raw.decode("utf-8", errors="replace"), content_type
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        try:
+            message = json.loads(raw).get("error", raw.decode("utf-8", errors="replace"))
+        except Exception:
+            message = raw.decode("utf-8", errors="replace")
+        raise SystemExit(f"HTTP {exc.code}: {message}") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"cannot reach {api_base()}: {exc.reason}") from exc
+
+
+def human_bytes(value: int | None) -> str:
+    if value is None:
+        return "unlimited"
+    number = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(number) < 1024 or unit == "TiB":
+            return f"{number:.1f} {unit}"
+        number /= 1024
+    return f"{value} B"
+
+
+def print_account(account: dict[str, Any], as_json: bool = False) -> None:
+    if as_json:
+        print(json.dumps(account, ensure_ascii=False, indent=2))
+        return
+    usage = account["usage"]
+    runtime = account["runtime"]
+    print(f"id:              {account['id']}")
+    print(f"name:            {account['name']}")
+    print(f"enabled:         {account['enabled']}")
+    print(f"running:         {runtime['running']} (pid={runtime['pid']})")
+    print(f"suspended:       {account['suspended_reason'] or '-'}")
+    print(f"max bandwidth:   {account['max_bps']} B/s ({account['max_bps'] * 8 / 1_000_000:.2f} Mbit/s)")
+    print(f"per-session max: {account['session_max_bps']} B/s")
+    print(f"sessions quota:  {account['allocation_quota']}")
+    print(f"traffic quota:   {human_bytes(account['traffic_quota_bytes'])}")
+    print(f"traffic used:    {human_bytes(usage['total_bytes'])}")
+    print(f"remaining:       {human_bytes(usage['remaining_bytes'])}")
+    print(f"active sessions: {usage['active_sessions']}")
+    print(f"relay ports:     {account['relay_port_range'][0]}-{account['relay_port_range'][1]}")
+    print(f"urls:            {', '.join(account['urls'])}")
+
+
+def command_list(args: argparse.Namespace) -> None:
+    payload, _content_type = request("GET", "/v1/accounts", token=args.admin_token)
+    accounts = payload["accounts"]
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    if not accounts:
+        print("no accounts")
+        return
+    print(f"{'ID':<18} {'NAME':<20} {'RUN':<5} {'SESS':<5} {'USED':>12} {'QUOTA':>12}")
+    for account in accounts:
+        print(
+            f"{account['id']:<18} {account['name'][:20]:<20} "
+            f"{str(account['runtime']['running']):<5} {account['usage']['active_sessions']:<5} "
+            f"{human_bytes(account['usage']['total_bytes']):>12} "
+            f"{human_bytes(account['traffic_quota_bytes']):>12}"
+        )
+
+
+def command_create(args: argparse.Namespace) -> None:
+    payload: dict[str, Any] = {
+        "name": args.name,
+        "allocation_quota": args.sessions,
+        "credential_ttl": args.ttl,
+    }
+    if args.max_mbps is not None:
+        payload["max_bps"] = int(args.max_mbps * 1_000_000 / 8)
+    if args.quota_gb is not None:
+        payload["traffic_quota_bytes"] = int(args.quota_gb * 1024**3)
+
+    account, _content_type = request("POST", "/v1/accounts", payload, token=args.admin_token)
+    api_key = account.pop("api_key")
+    print_account(account, as_json=args.json)
+    print(f"api_key:         {api_key}")
+    print("Store api_key now; it is not recoverable from the server.")
+
+    try:
+        ice, _content_type = request(
+            "POST", f"/v1/accounts/{account['id']}/credentials", token=args.admin_token
+        )
+        print("ice_servers:")
+        print(json.dumps({"iceServers": ice["ice_servers"]}, ensure_ascii=False, indent=2))
+    except SystemExit as exc:
+        print(f"warning: credentials are not available yet: {exc}", file=sys.stderr)
+
+
+def command_show(args: argparse.Namespace) -> None:
+    account, _content_type = request("GET", f"/v1/accounts/{args.account_id}", token=args.admin_token)
+    print_account(account, as_json=args.json)
+
+
+def command_usage(args: argparse.Namespace) -> None:
+    usage, _content_type = request(
+        "GET", f"/v1/accounts/{args.account_id}/usage", token=args.admin_token
+    )
+    if args.json:
+        print(json.dumps(usage, ensure_ascii=False, indent=2))
+        return
+    print(f"received:        {human_bytes(usage['received_bytes'])}")
+    print(f"sent:            {human_bytes(usage['sent_bytes'])}")
+    print(f"total:           {human_bytes(usage['total_bytes'])}")
+    print(f"remaining:       {human_bytes(usage['remaining_bytes'])}")
+    print(f"active sessions: {usage['active_sessions']}")
+    print(f"running:         {usage['runtime']['running']} (pid={usage['runtime']['pid']})")
+
+
+def command_credentials(args: argparse.Namespace) -> None:
+    payload = None if args.ttl is None else {"ttl_seconds": args.ttl}
+    result, _content_type = request(
+        "POST", f"/v1/accounts/{args.account_id}/credentials", payload, token=args.admin_token
+    )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    print(f"expires_at: {result['expires_at']}")
+    print(f"ttl_seconds: {result['ttl_seconds']}")
+    print("iceServers:")
+    print(json.dumps({"iceServers": result["ice_servers"]}, ensure_ascii=False, indent=2))
+
+
+def command_set(args: argparse.Namespace) -> None:
+    payload: dict[str, Any] = {}
+    if args.max_mbps is not None:
+        payload["max_bps"] = int(args.max_mbps * 1_000_000 / 8)
+    if args.sessions is not None:
+        payload["allocation_quota"] = args.sessions
+    if args.quota_gb is not None:
+        payload["traffic_quota_bytes"] = int(args.quota_gb * 1024**3)
+    if args.ttl is not None:
+        payload["credential_ttl"] = args.ttl
+    if args.name is not None:
+        payload["name"] = args.name
+    if not payload:
+        raise SystemExit("set requires at least one changed field")
+    account, _content_type = request(
+        "PATCH", f"/v1/accounts/{args.account_id}", payload, token=args.admin_token
+    )
+    print_account(account, as_json=args.json)
+
+
+def command_enabled(args: argparse.Namespace) -> None:
+    account, _content_type = request(
+        "PATCH",
+        f"/v1/accounts/{args.account_id}",
+        {"enabled": args.enabled},
+        token=args.admin_token,
+    )
+    print_account(account, as_json=args.json)
+
+
+def command_rotate(args: argparse.Namespace) -> None:
+    account, _content_type = request(
+        "POST", f"/v1/accounts/{args.account_id}/rotate-api-key", token=args.admin_token
+    )
+    api_key = account.pop("api_key")
+    print(f"account_id: {account['id']}")
+    print(f"api_key:    {api_key}")
+    print("Store api_key now; the old key is invalid.")
+
+
+def command_reset(args: argparse.Namespace) -> None:
+    account, _content_type = request(
+        "POST", f"/v1/accounts/{args.account_id}/reset-usage", token=args.admin_token
+    )
+    print_account(account, as_json=args.json)
+
+
+def command_delete(args: argparse.Namespace) -> None:
+    request("DELETE", f"/v1/accounts/{args.account_id}", token=args.admin_token)
+    print(f"deleted: {args.account_id}")
+
+
+def command_metrics(args: argparse.Namespace) -> None:
+    payload, _content_type = request("GET", "/metrics", token=args.admin_token)
+    print(payload, end="" if str(payload).endswith("\n") else "\n")
+
+
+def command_health(args: argparse.Namespace) -> None:
+    payload, _content_type = request("GET", "/healthz", authenticate=False)
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Manage Sconnect TURN accounts")
+    parser.add_argument("--api-url", help="override SCONNECT_API_URL")
+    parser.add_argument("--admin-token", help="override SCONNECT_ADMIN_TOKEN")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    health = subparsers.add_parser("health", help="check control-plane health")
+    health.set_defaults(handler=command_health)
+
+    list_parser = subparsers.add_parser("list", help="list accounts")
+    list_parser.add_argument("--json", action="store_true")
+    list_parser.set_defaults(handler=command_list)
+
+    create = subparsers.add_parser("create", help="create an account")
+    create.add_argument("name")
+    create.add_argument("--max-mbps", type=float, help="total account bandwidth in Mbit/s")
+    create.add_argument("--sessions", type=int, default=4, help="concurrent allocation quota")
+    create.add_argument("--quota-gb", type=float, help="traffic quota in GiB; 0 means unlimited")
+    create.add_argument("--ttl", type=int, default=3600, help="credential lifetime in seconds")
+    create.add_argument("--json", action="store_true")
+    create.set_defaults(handler=command_create)
+
+    show = subparsers.add_parser("show", help="show one account")
+    show.add_argument("account_id")
+    show.add_argument("--json", action="store_true")
+    show.set_defaults(handler=command_show)
+
+    usage = subparsers.add_parser("usage", help="show traffic usage")
+    usage.add_argument("account_id")
+    usage.add_argument("--json", action="store_true")
+    usage.set_defaults(handler=command_usage)
+
+    credentials = subparsers.add_parser("creds", aliases=["ice"], help="issue short-lived ICE credentials")
+    credentials.add_argument("account_id")
+    credentials.add_argument("--ttl", type=int)
+    credentials.add_argument("--json", action="store_true")
+    credentials.set_defaults(handler=command_credentials)
+
+    update = subparsers.add_parser("set", help="change account limits")
+    update.add_argument("account_id")
+    update.add_argument("--name")
+    update.add_argument("--max-mbps", type=float)
+    update.add_argument("--sessions", type=int)
+    update.add_argument("--quota-gb", type=float)
+    update.add_argument("--ttl", type=int)
+    update.add_argument("--json", action="store_true")
+    update.set_defaults(handler=command_set)
+
+    enable = subparsers.add_parser("enable", help="enable an account")
+    enable.add_argument("account_id")
+    enable.add_argument("--json", action="store_true")
+    enable.set_defaults(handler=command_enabled, enabled=True)
+
+    disable = subparsers.add_parser("disable", help="disable an account")
+    disable.add_argument("account_id")
+    disable.add_argument("--json", action="store_true")
+    disable.set_defaults(handler=command_enabled, enabled=False)
+
+    rotate = subparsers.add_parser("rotate-key", help="replace the account API key")
+    rotate.add_argument("account_id")
+    rotate.set_defaults(handler=command_rotate)
+
+    reset = subparsers.add_parser("reset-usage", help="clear usage and resume after a quota suspension")
+    reset.add_argument("account_id")
+    reset.add_argument("--json", action="store_true")
+    reset.set_defaults(handler=command_reset)
+
+    delete = subparsers.add_parser("delete", help="delete an account")
+    delete.add_argument("account_id")
+    delete.set_defaults(handler=command_delete)
+
+    metrics = subparsers.add_parser("metrics", help="print control-plane Prometheus metrics")
+    metrics.set_defaults(handler=command_metrics)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.api_url:
+        os.environ["SCONNECT_API_URL"] = args.api_url
+    if args.admin_token:
+        os.environ["SCONNECT_ADMIN_TOKEN"] = args.admin_token
+    args.handler(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
